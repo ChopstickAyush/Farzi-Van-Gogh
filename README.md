@@ -1,1 +1,1 @@
-# CS337
+# Farzi Van Gogh
