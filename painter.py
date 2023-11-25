@@ -11,6 +11,8 @@ import renderer
 
 import torch
 
+import torch.optim as optim
+
 # Decide which device we want to run on
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -280,6 +282,7 @@ class Painter(PainterBase):
         super(Painter, self).__init__(args=args)
 
         self.m_grid = args.m_grid
+        
 
         self.max_m_strokes = args.max_m_strokes
 
@@ -314,6 +317,155 @@ class Painter(PainterBase):
             cv2.waitKey(1)
 
 
+class VideoPainter():
+    def __init__(self, args):
+        self.args = args
+        self.m_grid = args.m_grid
+
+        self.max_m_strokes = args.max_m_strokes
+
+        self.video_path = args.video_path
+
+        self.painter = PainterBase(args=args)
+        self.first_frame = 1
+
+        # self.img_path = args.img_path
+        # self.img_ = cv2.imread(args.img_path, cv2.IMREAD_COLOR)
+        # self.img_ = cv2.cvtColor(self.img_, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.
+        # self.input_aspect_ratio = self.img_.shape[0] / self.img_.shape[1]
+        # self.img_ = cv2.resize(self.img_, (self.net_G.out_size * args.m_grid,
+        #                                    self.net_G.out_size * args.m_grid), cv2.INTER_AREA)
+
+        self.painter.m_strokes_per_block = int(args.max_m_strokes / (args.m_grid * args.m_grid))
+        self.painter.m_grid = args.m_grid
+        self.painter.img_path = self.video_path
+        # self.img_batch = utils.img2patches(self.img_, args.m_grid, self.net_G.out_size).to(device)
+        
+    def image_read(self, frame):
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.
+        input_aspect_ratio = frame.shape[0] / frame.shape[1]
+        frame = cv2.resize(frame, (self.painter.net_G.out_size * self.m_grid,
+                                           self.painter.net_G.out_size * self.m_grid), cv2.INTER_AREA)
+        return frame
+    
+
+
+    def _drawing_step_states(self,preview = True):
+        acc = self.painter._compute_acc().item()
+        print('iteration step %d, G_loss: %.5f, step_psnr: %.5f, strokes: %d / %d'
+              % (self.painter.step_id, self.painter.G_loss.item(), acc,
+                 (self.painter.anchor_id+1)*self.m_grid*self.m_grid,
+                 self.max_m_strokes))
+        vis2 = utils.patches2img(self.painter.G_final_pred_canvas, self.m_grid).clip(min=0, max=1)
+        if preview:
+            cv2.namedWindow('G_pred', cv2.WINDOW_NORMAL)
+            cv2.namedWindow('input', cv2.WINDOW_NORMAL)
+            cv2.imshow('G_pred', vis2[:,:,::-1])
+            cv2.imshow('input', self.painter.img_[:, :, ::-1])
+            cv2.waitKey(1)
+        
+    
+
+    def _draw_frame(self, frame, preview = False):
+        self.painter.img_ = frame
+        self.painter.img_batch = utils.img2patches(self.painter.img_, self.args.m_grid, self.painter.net_G.out_size).to(device)
+
+        # if(self.first_frame):
+        self.painter.initialize_params()
+        self.painter.x_ctt.requires_grad = True
+        self.painter.x_color.requires_grad = True
+        self.painter.x_alpha.requires_grad = True
+        utils.set_requires_grad(self.painter.net_G, False)
+            # self.first_frame = 0
+    
+
+        self.painter.optimizer_x = optim.RMSprop([self.painter.x_ctt, self.painter.x_color, self.painter.x_alpha], lr=self.painter.lr)
+
+    
+        self.painter.step_id = 0
+        for self.painter.anchor_id in range(0, self.painter.m_strokes_per_block):
+            self.painter.stroke_sampler(self.painter.anchor_id)
+            iters_per_stroke = int(500 / self.painter.m_strokes_per_block)
+            for i in range(iters_per_stroke):
+
+                self.painter.optimizer_x.zero_grad()
+
+                self.painter.x_ctt.data = torch.clamp(self.painter.x_ctt.data, 0.1, 1 - 0.1)
+                self.painter.x_color.data = torch.clamp(self.painter.x_color.data, 0, 1)
+                self.painter.x_alpha.data = torch.clamp(self.painter.x_alpha.data, 0, 1)
+
+                if self.args.canvas_color == 'white':
+                    self.painter.G_pred_canvas = torch.ones(
+                        [self.args.m_grid ** 2, 3, self.painter.net_G.out_size, self.painter.net_G.out_size]).to(device)
+                else:
+                    self.painter.G_pred_canvas = torch.zeros(
+                        [self.args.m_grid ** 2, 3, self.painter.net_G.out_size, self.painter.net_G.out_size]).to(device)
+
+                self.painter._forward_pass()
+                self._drawing_step_states()
+                self.painter._backward_x()
+                self.painter.optimizer_x.step()
+
+                self.painter.x_ctt.data = torch.clamp(self.painter.x_ctt.data, 0.1, 1 - 0.1)
+                self.painter.x_color.data = torch.clamp(self.painter.x_color.data, 0, 1)
+                self.painter.x_alpha.data = torch.clamp(self.painter.x_alpha.data, 0, 1)
+
+                self.painter.step_id += 1
+
+        v = self.painter.x.detach().cpu().numpy()
+        # self.painter._save_stroke_params(v)
+        v_n = self.painter._normalize_strokes(self.painter.x)
+        v_n = self.painter._shuffle_strokes_and_reshape(v_n)
+        final_rendered_image = self.painter._render(v_n, save_jpgs=False, save_video=False)
+
+        if(preview):
+            cv2.namedWindow('G_pred', cv2.WINDOW_NORMAL)
+            cv2.imshow('G_pred', final_rendered_image[:,:,::-1])
+            cv2.waitKey(1)
+        
+        return final_rendered_image
+
+    def _draw_frame_by_frame(self):
+
+        self.painter._load_checkpoint()
+        self.painter.net_G.eval()
+
+        cap = cv2.VideoCapture(self.video_path)
+
+
+        #in order to get the size of width and shape of video, we used first frame of video
+        ret, frame = cap.read()
+        frame_width = self.image_read(frame).shape[1]
+        frame_height= self.image_read(frame).shape[0]
+
+        out = cv2.VideoWriter('./output/output.mp4', cv2.VideoWriter_fourcc('m', 'p', '4', 'v'), 10, 
+                            (self.args.canvas_size,self.args.canvas_size))
+        print(self.args.canvas_size)
+        frames = 0
+        while True:
+            ret, frame = cap.read()
+            if ret == True:
+                frames += 1
+                if(frames % 3 == 1):
+                    print(f"FRAMECOUNT: {frames}/120")
+                    frame = self.image_read(frame)
+                    
+                    final_rendered_frame = self._draw_frame(frame)
+                    
+                    final_rendered_frame = np.uint8(final_rendered_frame*255)
+                    final_rendered_frame = cv2.cvtColor(final_rendered_frame, cv2.COLOR_BGR2RGB) 
+        
+                    out.write(final_rendered_frame)
+            else:
+                break
+
+        cap.release()
+        out.release()
+
+        
+
+
+   
 
 
 
