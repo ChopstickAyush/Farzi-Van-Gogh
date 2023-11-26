@@ -1,0 +1,1 @@
+initialize network with normal
