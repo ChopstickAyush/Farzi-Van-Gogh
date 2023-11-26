@@ -99,6 +99,8 @@ def define_G(rdrr, netG, init_type='normal', init_gain=0.02, gpu_ids=[]):
     net = None
     if netG == 'plain-dcgan':
         net = DCGAN(rdrr)
+    if netG == 'dcgan-light':
+        net = DCGAN_32(rdrr)
     elif netG == 'plain-unet':
         net = UNet(rdrr)
     elif netG == 'huang-net':
@@ -107,6 +109,8 @@ def define_G(rdrr, netG, init_type='normal', init_gain=0.02, gpu_ids=[]):
         net = ZouFCNFusion(rdrr)
     elif netG == 'zou-fusion-net-light':
         net = ZouFCNFusionLight(rdrr)
+    elif netG == 'light-net':
+        net = LightNet(rdrr)
     else:
         raise NotImplementedError('Generator model name [%s] is not recognized' % netG)
     return init_net(net, init_type, init_gain, gpu_ids)
@@ -239,6 +243,87 @@ class PixelShuffleNet_32(nn.Module):
         x = self.pixel_shuffle(self.conv2(x))
         x = x.view(-1, 3, 32, 32)
         return x
+
+class Rasterizer(nn.Module):
+    def __init__(self, input_nc):
+        super(Rasterizer, self).__init__()
+        self.fc1 = (nn.Linear(input_nc, 512))
+#         self.fc2 = (nn.Linear(512, 1024))
+#         self.fc3 = (nn.Linear(1024, 2048))
+        self.fc4 = (nn.Linear(512, 4096))
+        self.conv1 = (nn.Conv2d(16, 32, 3, 1, 1))
+        self.conv2 = (nn.Conv2d(32, 32, 3, 1, 1))
+        self.conv3 = (nn.Conv2d(8, 16, 3, 1, 1))
+        self.conv4 = (nn.Conv2d(16, 16, 3, 1, 1))
+        self.conv5 = (nn.Conv2d(4, 8, 3, 1, 1))
+        self.conv6 = (nn.Conv2d(8, 4*3, 3, 1, 1))
+        self.pixel_shuffle = nn.PixelShuffle(2)
+
+    def forward(self, x):
+        x = x.squeeze()
+        x = F.relu(self.fc1(x))
+#         x = F.relu(self.fc2(x))
+#         x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
+        x = x.view(-1, 16, 16, 16)
+        x = F.relu(self.conv1(x))
+        x = self.pixel_shuffle(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = self.pixel_shuffle(self.conv4(x))
+        x = F.relu(self.conv5(x))
+        x = self.pixel_shuffle(self.conv6(x))
+        x = x.view(-1, 3, 128, 128)
+        return x
+
+class Shader(nn.Module):
+    def __init__(self, rdrr, ngf=64):
+        super(Shader, self).__init__()
+        input_nc = rdrr.d
+        self.out_size = 128
+        self.main = nn.Sequential(
+            # input is Z, going into a convolution
+            nn.ConvTranspose2d(input_nc, ngf * 8, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(ngf * 8),
+            nn.ReLU(True),
+            # state size. (ngf*8) x 4 x 4
+
+            nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 4, 0, bias=False),
+            nn.BatchNorm2d(ngf * 4),
+            nn.ReLU(True),
+            # state size. (ngf*4) x 16 x 16
+
+            nn.ConvTranspose2d(ngf * 4, ngf * 4, 4, 4, 0, bias=False),
+            nn.BatchNorm2d(ngf * 4),
+            nn.ReLU(True),
+            # state size. (ngf*4) x 64 x 64
+
+            nn.ConvTranspose2d(ngf * 4, 6, 4, 2, 1, bias=False),
+
+
+        )
+
+    def forward(self, input):
+        output_tensor = self.main(input)
+        return output_tensor[:,0:3,:,:], output_tensor[:,3:6,:,:]
+
+class LightNet(nn.Module):
+    def __init__(self, rdrr):
+        super(LightNet, self).__init__()
+        self.rdrr = rdrr
+        self.out_size = 128
+        self.rasterizer = Rasterizer(rdrr.d_shape)
+        self.shader = Shader(rdrr)
+
+    def forward(self, x):
+        x_shape = x[:, 0:self.rdrr.d_shape, :, :]
+        x_alpha = x[:, [-1], :, :]
+        if self.rdrr.renderer in ['oilpaintbrush', 'airbrush']:
+            x_alpha = torch.tensor(1.0).to(device)
+
+        mask = self.rasterizer(x_shape)
+        color, _ = self.shader(x)
+
+        return color * mask, x_alpha * mask
 
 
 
