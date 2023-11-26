@@ -5,7 +5,10 @@ import utils
 import matplotlib.pyplot as plt
 import numpy as np
 import random
+import cv2
+from scipy import ndimage
 import pytorch_batch_sinkhorn as spc
+import torch.nn.functional as F
 
 # Decide which device we want to run on
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -98,6 +101,7 @@ class VGGStyleLoss(torch.nn.Module):
         self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
         self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
         self.resize = resize
+        self.lap_param = 0.1
 
     def gram_matrix(self, y):
         # b -> no of batches
@@ -107,6 +111,18 @@ class VGGStyleLoss(torch.nn.Module):
         # gram size = b x ch x ch
         gram = features.bmm(features_t) / (ch * w * h)
         return gram
+
+    def lap_loss(self,x,y):
+        
+        
+        kernel = torch.tensor([[0.0, -1.0, 0.0],[-1.0, 4.0, -1.0],[0.0, -1.0, 0.0]]).to(device)
+        kernel = kernel.view(1, 1, 3, 3).repeat(1,x.shape[1], 1, 1)
+
+
+        x_lap= F.conv2d(x, kernel)
+        y_lap= F.conv2d(y, kernel)
+        return torch.abs(torch.sum((x_lap-y_lap)))
+        
 
     def forward(self, input, target):
         if input.shape[1] != 3:
@@ -125,6 +141,9 @@ class VGGStyleLoss(torch.nn.Module):
             y = block(y)
             gm_x = self.gram_matrix(x)
             gm_y = self.gram_matrix(y)
+            ###### Adding code for laplacian matrix #####################
+            lap_loss = self.lap_loss(x,y)
+            loss += lap_loss*self.lap_param
             loss += torch.sum((gm_x-gm_y)**2)
         return loss
 
