@@ -111,7 +111,7 @@ class PainterBase():
 
         return v
 
-    def _render(self, v, save_jpgs=True, save_video=True):
+    def _render(self, v, save_jpgs=False, save_video=False):
 
         v =       v[0,:,:]
         if self.args.keep_aspect_ratio:
@@ -153,9 +153,9 @@ class PainterBase():
             plt.imsave(file_name + '_input.png', out_img)
 
         final_rendered_image = np.copy(this_frame)
-        if save_jpgs:
-            print('saving final rendered result...')
-            plt.imsave(file_name + '_final.png', final_rendered_image)
+        # if save_jpgs:
+        print('saving final rendered result...')
+        plt.imsave(file_name + '_final.png', final_rendered_image)
 
         return final_rendered_image
 
@@ -236,14 +236,20 @@ class PainterBase():
             self.x_alpha.data[i, anchor_id, :] = torch.tensor(self.rderr.stroke_params[-1])
 
 
-    def _backward_x(self):
+    def _backward_x(self, is_video = False, prev_frame = None, lam = 0.0):
 
+        
         self.G_loss = 0
         self.G_loss += self.args.beta_L1 * self._pxl_loss(
             canvas=self.G_final_pred_canvas, gt=self.img_batch)
         if self.args.with_ot_loss:
             self.G_loss += self.args.beta_ot * self._sinkhorn_loss(
                 self.G_final_pred_canvas, self.img_batch)
+        if is_video:
+            final = utils.patches2img(self.G_final_pred_canvas, self.m_grid).clip(min=0, max=1)
+            # print(self.G_pred_canvas.shape)
+            # prev_frame_batches
+            self.G_loss += (lam * torch.mean((torch.tensor(prev_frame) - final)**2)).to(device)
         self.G_loss.backward()
 
 
@@ -265,6 +271,8 @@ class PainterBase():
             self.G_pred_alphas, [self.m_grid*self.m_grid, self.anchor_id+1, 3,
                                  self.net_G.out_size, self.net_G.out_size])
 
+
+        
         for i in range(self.anchor_id+1):
             G_pred_foreground = self.G_pred_foregrounds[:, i]
             G_pred_alpha = self.G_pred_alphas[:, i]
@@ -328,7 +336,7 @@ class VideoPainter():
 
         self.painter = PainterBase(args=args)
         self.first_frame = 1
-
+        self.prev_frame = None
         # self.img_path = args.img_path
         # self.img_ = cv2.imread(args.img_path, cv2.IMREAD_COLOR)
         # self.img_ = cv2.cvtColor(self.img_, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.
@@ -361,7 +369,7 @@ class VideoPainter():
             cv2.namedWindow('G_pred', cv2.WINDOW_NORMAL)
             cv2.namedWindow('input', cv2.WINDOW_NORMAL)
             cv2.imshow('G_pred', vis2[:,:,::-1])
-            cv2.imshow('input', self.painter.img_[:, :, ::-1])
+            cv2.imshow('input', self.painter.img_[:,:,::-1])
             cv2.waitKey(1)
         
     
@@ -403,7 +411,10 @@ class VideoPainter():
 
                 self.painter._forward_pass()
                 self._drawing_step_states()
-                self.painter._backward_x()
+                if(self.first_frame):
+                    self.painter._backward_x()
+                else:
+                    self.painter._backward_x(is_video=True, prev_frame= self.prev_frame ,lam=1)
                 self.painter.optimizer_x.step()
 
                 self.painter.x_ctt.data = torch.clamp(self.painter.x_ctt.data, 0.1, 1 - 0.1)
@@ -411,12 +422,16 @@ class VideoPainter():
                 self.painter.x_alpha.data = torch.clamp(self.painter.x_alpha.data, 0, 1)
 
                 self.painter.step_id += 1
-
+        
+        if(self.first_frame):
+            self.first_frame = 0
+        
         v = self.painter.x.detach().cpu().numpy()
         # self.painter._save_stroke_params(v)
         v_n = self.painter._normalize_strokes(self.painter.x)
         v_n = self.painter._shuffle_strokes_and_reshape(v_n)
         final_rendered_image = self.painter._render(v_n, save_jpgs=False, save_video=False)
+        self.prev_frame = utils.patches2img(self.painter.G_final_pred_canvas, self.painter.m_grid).clip(min=0, max=1)
 
         if(preview):
             cv2.namedWindow('G_pred', cv2.WINDOW_NORMAL)
@@ -453,6 +468,7 @@ class VideoPainter():
                     final_rendered_frame = self._draw_frame(frame)
                     
                     final_rendered_frame = np.uint8(final_rendered_frame*255)
+                    plt.imsave(f"./output_frames/vid_{frames}.png",final_rendered_frame)
                     final_rendered_frame = cv2.cvtColor(final_rendered_frame, cv2.COLOR_BGR2RGB) 
         
                     out.write(final_rendered_frame)
@@ -519,13 +535,13 @@ class ProgressivePainter(PainterBase):
 
 class NeuralStyleTransfer(PainterBase):
 
-    def __init__(self, args):
+    def __init__(self, args,lap_loss_param):
         super(NeuralStyleTransfer, self).__init__(args=args)
 
         self.args = args
 
-        self._style_loss = loss.VGGStyleLoss(transfer_mode=args.transfer_mode, resize=True)
-
+        self._style_loss = loss.VGGStyleLoss(transfer_mode=args.transfer_mode, resize=True,lap_loss_param=lap_loss_param)
+        self.lap_loss_param=lap_loss_param
         print('loading pre-generated vector file...')
         if os.path.exists(args.vector_file) is False:
             exit('vector file does not exist, pls check --vector_file, or run demo.py fist')
@@ -620,8 +636,8 @@ class NeuralStyleTransfer(PainterBase):
 
         out_img = cv2.resize(self.style_img_, (out_w, out_h), cv2.INTER_AREA)
         plt.imsave(file_dir + '_style_img_' +
-                   self.style_img_path.split('/')[-1][:-4] + '.png', out_img)
+                   self.style_img_path.split('/')[-1][:-4] + str(self.lap_loss_param)+'.png', out_img)
 
         out_img = cv2.resize(final_rendered_image, (out_w, out_h), cv2.INTER_AREA)
         plt.imsave(file_dir + '_style_transfer_' +
-                   self.style_img_path.split('/')[-1][:-4] + '.png', out_img)
+                   self.style_img_path.split('/')[-1][:-4] + str(self.lap_loss_param)+'.png', out_img)
