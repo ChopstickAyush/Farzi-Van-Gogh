@@ -311,8 +311,8 @@ class LightNet(nn.Module):
         super(LightNet, self).__init__()
         self.rdrr = rdrr
         self.out_size = 128
-        self.rasterizer = Rasterizer(rdrr.d_shape)
-        self.shader = Shader(rdrr)
+        self.huangnet = Rasterizer(rdrr.d_shape)
+        self.dcgan = Shader(rdrr)
 
     def forward(self, x):
         x_shape = x[:, 0:self.rdrr.d_shape, :, :]
@@ -320,8 +320,8 @@ class LightNet(nn.Module):
         if self.rdrr.renderer in ['oilpaintbrush', 'airbrush']:
             x_alpha = torch.tensor(1.0).to(device)
 
-        mask = self.rasterizer(x_shape)
-        color, _ = self.shader(x)
+        mask = self.huangnet(x_shape)
+        color, _ = self.dcgan(x)
 
         return color * mask, x_alpha * mask
 
